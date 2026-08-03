@@ -86,6 +86,16 @@ streamlit run dashboard.py
    El secret queda cifrado del lado de Streamlit Cloud — nunca toca GitHub.
 5. **Deploy**. La app se duerme por inactividad pero despierta sola al abrirla (unos segundos).
 
+### Troubleshooting: `Problem with the SSL CA cert (path? access rights?)`
+
+Si al desplegar ves este error al leer de Blob, **no es tu connection string ni permisos de Azure**: es el mensaje de error de libcurl (`CURLE_SSL_CACERT`) porque el contenedor de Streamlit Cloud no trae instalado el paquete `ca-certificates`, y la extensión `azure` de DuckDB usa libcurl/OpenSSL por debajo en Linux para las conexiones TLS. El repo ya incluye un `packages.txt` con:
+
+```
+ca-certificates
+```
+
+Streamlit Cloud lo detecta automáticamente y corre `apt-get install` con esos paquetes antes de instalar las dependencias de Python (igual que un Aptfile de Heroku) — no requiere ninguna acción extra, pero si volvés a ver este error después de tocar `packages.txt`, hacé un **Reboot app** desde el menú de la app en Streamlit Cloud para forzar un rebuild del contenedor.
+
 ## Seguridad
 
 - El connection string **nunca está en el código**: se lee de `AZURE_STORAGE_CONNECTION_STRING` (env var local o `st.secrets` en la nube). `dashboard.py` no tiene ningún secreto hardcodeado.
@@ -99,7 +109,8 @@ streamlit run dashboard.py
 ```
 .
 ├── dashboard.py                 # app de Streamlit (única fuente de la UI y la carga de datos)
-├── requirements_dashboard.txt   # dependencias
+├── requirements_dashboard.txt   # dependencias de Python
+├── packages.txt                 # dependencias de sistema (apt) — ca-certificates para DuckDB+azure
 ├── .streamlit/
 │   └── config.toml              # tema oscuro nativo de Streamlit
 └── .gitignore                   # excluye .env
