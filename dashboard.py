@@ -39,6 +39,12 @@ CONN_STR = os.environ.get("AZURE_STORAGE_CONNECTION_STRING") or \
     (st.secrets.get("AZURE_STORAGE_CONNECTION_STRING") if hasattr(st, "secrets") else None)
 GOLD_LOCAL = os.environ.get("GOLD_LOCAL_PATH")   # si está, lee de disco (modo prueba)
 
+# Red de seguridad para el error "Problem with the SSL CA cert" en contenedores
+# tipo Streamlit Cloud: le decimos al transporte curl de la extensión azure
+# dónde está el bundle de certs del sistema (Debian/Ubuntu), sin pisar un valor
+# que ya venga seteado en el entorno.
+os.environ.setdefault("CURL_CA_INFO", "/etc/ssl/certs/ca-certificates.crt")
+
 # ------------------------------------------------------------------------------
 # IDENTIDAD VISUAL — inspirada en el portfolio (aviles17.github.io/My_react_resume):
 # navy profundo, acento verde menta, tipografía Raleway en negrita con subrayado.
@@ -111,6 +117,10 @@ def load_data():
         dfec = f"'{base}/dim_fecha.parquet'"
     else:
         con.execute("INSTALL azure; LOAD azure;")
+        # transporte por defecto del SDK de Azure no siempre encuentra el bundle
+        # de CA certs del contenedor (Streamlit Cloud) -> forzamos transporte curl,
+        # que sí respeta la ubicación estándar de certs del sistema (o CURL_CA_INFO/CURL_CA_PATH).
+        con.execute("SET azure_transport_option_type = 'curl';")
         con.execute(f"SET azure_storage_connection_string='{CONN_STR}';")
         b = f"azure://{CONTAINER}/gold"
         fact = f"'{b}/fact_fatture/**/*.parquet'"

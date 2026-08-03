@@ -88,13 +88,16 @@ streamlit run dashboard.py
 
 ### Troubleshooting: `Problem with the SSL CA cert (path? access rights?)`
 
-Si al desplegar ves este error al leer de Blob, **no es tu connection string ni permisos de Azure**: es el mensaje de error de libcurl (`CURLE_SSL_CACERT`) porque el contenedor de Streamlit Cloud no trae instalado el paquete `ca-certificates`, y la extensión `azure` de DuckDB usa libcurl/OpenSSL por debajo en Linux para las conexiones TLS. El repo ya incluye un `packages.txt` con:
+Si al desplegar ves este error al leer de Blob, **no es tu connection string ni permisos de Azure**: es el mensaje de error de libcurl (`CURLE_SSL_CACERT`). Tiene dos partes:
 
-```
-ca-certificates
-```
+1. **El contenedor necesita el bundle de certs instalado.** El repo incluye un `packages.txt` con `ca-certificates`, que Streamlit Cloud instala automáticamente vía `apt-get` antes de las dependencias de Python (igual que un Aptfile de Heroku).
+2. **DuckDB necesita que se le diga que use ese bundle.** Por defecto, la extensión `azure` usa el transporte HTTP propio del Azure SDK, que en algunos contenedores (incluido el de Streamlit Cloud) no ubica el bundle de certs del sistema aunque esté instalado — el paso 1 solo no alcanza. `dashboard.py` fuerza el transporte `curl` (que sí lo respeta) y además apunta explícitamente a la ruta estándar de Debian/Ubuntu como red de seguridad:
+   ```python
+   con.execute("SET azure_transport_option_type = 'curl';")
+   os.environ.setdefault("CURL_CA_INFO", "/etc/ssl/certs/ca-certificates.crt")
+   ```
 
-Streamlit Cloud lo detecta automáticamente y corre `apt-get install` con esos paquetes antes de instalar las dependencias de Python (igual que un Aptfile de Heroku) — no requiere ninguna acción extra, pero si volvés a ver este error después de tocar `packages.txt`, hacé un **Reboot app** desde el menú de la app en Streamlit Cloud para forzar un rebuild del contenedor.
+Si volvés a ver este error después de tocar `packages.txt` o `dashboard.py`, hacé un **Reboot app** desde el menú de la app en Streamlit Cloud para forzar un rebuild del contenedor.
 
 ## Seguridad
 
