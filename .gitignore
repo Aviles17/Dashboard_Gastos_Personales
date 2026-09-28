@@ -1,2 +1,4 @@
 # .gitignore
 .env
+sample_investments/
+__pycache__/

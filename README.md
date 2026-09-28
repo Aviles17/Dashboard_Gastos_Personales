@@ -33,6 +33,21 @@ Identidad visual inspirada en [mi portfolio](https://aviles17.github.io/My_react
 
 En Blob, la app espera el layout `azure://<container>/gold/<tabla>/...` (contenedor por defecto: `lakehouse`, definido en `CONTAINER` dentro de `dashboard.py`).
 
+### Inversiones
+
+La pestaña **Inversiones** lee sus posiciones desde un **Blob Storage aparte** del de gastos (`INVESTMENTS_CONTAINER`/`INVESTMENTS_PATH` en `dashboard.py`, por defecto `datalake/Dashboard_Finanzas_Personales`), en dos archivos CSV:
+
+| Archivo (Blob: `<container>/<path>/`) | Columnas |
+|---|---|
+| `Portafolio_Fijo.csv` (CDT / Bolsillos / Alcancías) | `Producto`, `Tipo`, `Entidad`, `Capital Invertido (COP)`, `TEA (%)`, `Moneda`, `Fecha Apertura`, `Fecha Vencimiento` (vacío si no aplica), `Notas` |
+| `Portafolio_Activo.csv` (acciones / ETF) | `Ticker`, `Nombre`, `Cantidad`, `Precio Entrada (USD)`, `Precio Actual (USD)`, `Fecha Entrada` (+ otras columnas del tracker de tesis que la app ignora: `Componente`, `Stop-Loss`, `Tesis Vinculada`, etc.) |
+
+`investments_data.py` normaliza ambos a un esquema interno agnóstico de la fuente (pensado para poder reemplazar el CSV por tablas Gold reales sin tocar `dashboard.py`), y trae precios en vivo + la tasa USD/COP desde [Twelve Data](https://twelvedata.com/) (`/price`, `/exchange_rate`, `/time_series`). Si `TWELVE_DATA_API_KEY` no está seteada, o si Twelve Data cae, la app cae de vuelta al último precio guardado en el CSV — nunca rompe la pestaña.
+
+La tasa USD/COP en particular tiene una cadena de 3 respaldos, porque toda la conversión de la cartera variable depende de ella: (1) Twelve Data, (2) [open.er-api.com](https://www.exchangerate-api.com/docs/free) (fallback gratuito, sin API key), (3) un valor fijo configurable por `USD_COP_FALLBACK_RATE`. Solo si los 3 fallan la tarjeta muestra "No disponible".
+
+La renta variable se muestra en USD (su moneda nativa); para las tarjetas y gráficos que la combinan con la renta fija (en COP) se convierte con la tasa USD/COP del momento — si esa tasa no está disponible, la renta variable se excluye de esos totales combinados en vez de sumar montos en monedas distintas por error.
+
 ## Instalación local
 
 ```bash
@@ -69,6 +84,27 @@ AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=stga
 ```bash
 streamlit run dashboard.py
 ```
+
+### Inversiones — `AZURE_INVESTMENTS_CONNECTION_STRING` / `INVESTMENTS_LOCAL_PATH` / `TWELVE_DATA_API_KEY`
+
+Mismo patrón que arriba, pero para la pestaña Inversiones (Blob separado del de gastos):
+
+```bash
+# Local / prueba: carpeta con Portafolio_Fijo.csv y Portafolio_Activo.csv
+INVESTMENTS_LOCAL_PATH=./sample_investments
+
+# Producción (en vez de INVESTMENTS_LOCAL_PATH)
+AZURE_INVESTMENTS_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;EndpointSuffix=core.windows.net"
+
+# En ambos modos, para precios en vivo y tasa USD/COP (si falta, cae al CSV)
+TWELVE_DATA_API_KEY="<tu-api-key>"
+
+# Opcional: último respaldo para la tasa USD/COP si Twelve Data Y
+# open.er-api.com fallan los dos (ej. ambos caídos o sin internet saliente)
+USD_COP_FALLBACK_RATE=4000
+```
+
+`sample_investments/` está en `.gitignore` porque normalmente va a contener datos reales de portafolio — nunca se commitea.
 
 ## Tema visual
 
@@ -111,21 +147,23 @@ Si volvés a ver este error después de tocar `packages.txt` o `dashboard.py`, h
 
 ```
 .
-├── dashboard.py                 # app de Streamlit (única fuente de la UI y la carga de datos)
+├── dashboard.py                 # app de Streamlit (UI + carga de datos de gastos)
+├── investments_data.py          # carga/normaliza CSVs de inversión + Twelve Data (sin Streamlit)
 ├── requirements_dashboard.txt   # dependencias de Python
 ├── packages.txt                 # dependencias de sistema (apt) — ca-certificates para DuckDB+azure
 ├── .streamlit/
 │   └── config.toml              # tema oscuro nativo de Streamlit
-└── .gitignore                   # excluye .env
+└── .gitignore                   # excluye .env y sample_investments/
 ```
 
 ## Stack
 
 - [Streamlit](https://streamlit.io/) — UI y despliegue
-- [DuckDB](https://duckdb.org/) (+ extensión `azure`) — lectura de Parquet directo desde Blob
+- [DuckDB](https://duckdb.org/) (+ extensión `azure`) — lectura de Parquet/CSV directo desde Blob
 - [Plotly](https://plotly.com/python/) — gráficos
 - [pandas](https://pandas.pydata.org/)
 - [python-dotenv](https://pypi.org/project/python-dotenv/)
+- [Twelve Data](https://twelvedata.com/) (vía `requests`) — precios en vivo y tasa USD/COP para la pestaña Inversiones
 
 ---
 
