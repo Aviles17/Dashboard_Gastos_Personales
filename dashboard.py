@@ -19,8 +19,10 @@ Ejecutar:
 """
 
 import os
+import re
 import math
 import logging
+from datetime import datetime
 import duckdb
 import pandas as pd
 import streamlit as st
@@ -188,7 +190,34 @@ def load_data():
     return df
 
 
+# Capa de estandarización TEMPORAL: en Gold algunas categorías vienen con
+# emoji al inicio del nombre (ej. "🍔 Mercado") y otras sin él (ej. "Mercado"),
+# lo que las separa en grupos distintos en los gráficos/tablas. Esto debería
+# resolverse en el pipeline de origen (dim_categoria); mientras tanto, se
+# limpia acá para que la agrupación sea consistente.
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # pictogramas, símbolos, emoji extendidos
+    "\U00002600-\U000026FF"  # símbolos misceláneos (☀ ☕ ⚽ etc.)
+    "\U00002700-\U000027BF"  # dingbats (✂ ✈ ❤ etc.)
+    "\U0001F1E6-\U0001F1FF"  # banderas (pares de letras regionales)
+    "\U00002B00-\U00002BFF"  # flechas/símbolos misceláneos adicionales
+    "️"                 # variation selector (modificador de emoji)
+    "‍"                 # zero-width joiner (emoji compuestos)
+    "]+"
+)
+
+
+def _strip_emoji(texto):
+    if not isinstance(texto, str):
+        return texto
+    return _EMOJI_PATTERN.sub("", texto).strip()
+
+
 def money(x):
+    """Formato abreviado ($29.3M / $450K) — solo para la pestaña Balance,
+    donde las cifras son grandes y mostrar todas las cifras significativas
+    agregaría ruido en vez de precisión."""
     sign = "-" if x < 0 else ""
     absx = abs(x)
     if absx >= 1_000_000:
@@ -224,6 +253,48 @@ def sig_pct(x, n=3):
     return f"{x:.{decimals}f}%"
 
 
+def _utc_offset_label(dt):
+    """'UTC-5' / 'UTC+5:30' a partir del offset de un datetime tz-aware."""
+    offset = dt.utcoffset()
+    if offset is None:
+        return None
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    h, m = divmod(abs(total_minutes), 60)
+    return f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
+
+def timestamp_label(fetched_at):
+    """Timestamp legible del último fetch real (hora local + zona horaria),
+    para reemplazar frases vagas como '(cierre reciente)' por una referencia
+    de tiempo concreta."""
+    if not fetched_at:
+        return None
+    base = fetched_at.strftime("%d %b %H:%M")
+    tz = _utc_offset_label(fetched_at)
+    return f"{base} {tz}" if tz else base
+
+
+def freshness_badge(source, fetched_at, stale_after_min=15):
+    """Indicador de qué tan reciente es un dato que viene de una fuente externa
+    (Twelve Data / TRM): color + 'hace X min' según el timestamp del último
+    fetch real (no de cuándo se renderiza la página)."""
+    if source is None:
+        return f'<span style="color:{MUTED}">●</span> no disponible'
+    if fetched_at is None:
+        return f'<span style="color:{MUTED}">●</span> no se actualiza (valor fijo)'
+    now = datetime.now(fetched_at.tzinfo) if fetched_at.tzinfo else datetime.now()
+    delta_min = (now - fetched_at).total_seconds() / 60
+    if delta_min < 1:
+        edad = "hace instantes"
+    elif delta_min < 60:
+        edad = f"hace {int(delta_min)} min"
+    else:
+        edad = f"hace {int(delta_min // 60)} h"
+    color = SAGE if delta_min <= stale_after_min else RUST
+    return f'<span style="color:{color}">●</span> {edad}'
+
+
 # ------------------------------------------------------------------------------
 # DATOS DE INVERSIONES  (CSV en Blob/local + precios en vivo de Twelve Data)
 # ------------------------------------------------------------------------------
@@ -256,7 +327,10 @@ def load_investment_positions():
     var_pos_df = investments_data.load_variable_positions(var_raw)
     tickers = var_pos_df["ticker"].tolist()
     historical_df = investments_data.fetch_historical_monthly_series(tickers, TWELVE_DATA_API_KEY)
-    return fixed_df, var_pos_df, historical_df
+    # timestamp del fetch real (no de cuándo se renderiza la página), para el
+    # indicador de frescura de datos — None si no vinieron de Twelve Data.
+    precios_fetched_at = datetime.now().astimezone() if not historical_df.empty else None
+    return fixed_df, var_pos_df, historical_df, precios_fetched_at
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -277,25 +351,25 @@ def load_live_fx_rate():
     # key, y por último un valor fijo configurable por .env/secrets.
     rate = investments_data.fetch_usd_cop_rate(TWELVE_DATA_API_KEY)
     if rate:
-        return rate, "Twelve Data"
+        return rate, "Twelve Data", datetime.now().astimezone()
 
     rate = investments_data.fetch_usd_cop_rate_fallback()
     if rate:
-        return rate, "open.er-api.com"
+        return rate, "open.er-api.com", datetime.now().astimezone()
 
     if USD_COP_FALLBACK_RATE:
         logging.getLogger(__name__).warning(
             "Tasa USD/COP: Twelve Data y el fallback fallaron, usando valor "
             "fijo configurado (USD_COP_FALLBACK_RATE=%s)", USD_COP_FALLBACK_RATE)
-        return USD_COP_FALLBACK_RATE, "valor fijo (.env)"
+        return USD_COP_FALLBACK_RATE, "valor fijo (.env)", None
 
-    return None, None
+    return None, None, None
 
 
 @st.cache_data(ttl=600, show_spinner="Generando datos de inversión…")
 def load_investment_data(ciclos_all):
-    fixed_df, var_pos_df, historical_df = load_investment_positions()
-    fx_rate, fx_source = load_live_fx_rate()
+    fixed_df, var_pos_df, historical_df, precios_fetched_at = load_investment_positions()
+    fx_rate, fx_source, fx_fetched_at = load_live_fx_rate()
 
     var_price_df = investments_data.build_variable_price_series(
         var_pos_df, ciclos_all, historical_df, {})
@@ -303,7 +377,11 @@ def load_investment_data(ciclos_all):
     cycle_df = investments_data.build_investment_cycle_summary(
         fixed_df, var_pos_df, var_price_df, ciclos_all, fx_by_cycle)
     precios_en_vivo = not historical_df.empty
-    return fixed_df, var_pos_df, var_price_df, cycle_df, fx_rate, fx_source, precios_en_vivo
+    meta = {
+        "fx_rate": fx_rate, "fx_source": fx_source, "fx_fetched_at": fx_fetched_at,
+        "precios_en_vivo": precios_en_vivo, "precios_fetched_at": precios_fetched_at,
+    }
+    return fixed_df, var_pos_df, var_price_df, cycle_df, meta
 
 
 # ------------------------------------------------------------------------------
@@ -319,11 +397,12 @@ if data.empty:
     st.info("No hay datos en Gold todavía. Corré el pipeline con un CSV en landing/.")
     st.stop()
 
+data["categoria"] = data["categoria"].map(_strip_emoji)
+
 ciclos_all = sorted(data["ciclo"].unique())
 
 try:
-    (inv_fixed_df, inv_var_pos_df, inv_var_price_df, inv_cycle_df,
-     inv_fx_rate, inv_fx_source, inv_precios_en_vivo) = load_investment_data(ciclos_all)
+    (inv_fixed_df, inv_var_pos_df, inv_var_price_df, inv_cycle_df, inv_meta) = load_investment_data(ciclos_all)
     inv_error = None
 except Exception as e:
     inv_error = str(e)
@@ -336,9 +415,12 @@ except Exception as e:
     inv_var_price_df = pd.DataFrame(columns=["id_posicion", "ciclo", "precio"])
     inv_cycle_df = investments_data.build_investment_cycle_summary(
         inv_fixed_df, inv_var_pos_df, inv_var_price_df, ciclos_all, {})
-    inv_fx_rate = None
-    inv_fx_source = None
-    inv_precios_en_vivo = False
+    inv_meta = {"fx_rate": None, "fx_source": None, "fx_fetched_at": None,
+                "precios_en_vivo": False, "precios_fetched_at": None}
+
+inv_fx_rate = inv_meta["fx_rate"]
+inv_fx_source = inv_meta["fx_source"]
+inv_precios_en_vivo = inv_meta["precios_en_vivo"]
 
 tab_balance, tab_inversiones = st.tabs(["Balance", "Inversiones"])
 
@@ -532,22 +614,22 @@ with tab_inversiones:
     with c1:
         sub = "Fija + variable" if inv_fx_rate else "Fija + variable (variable sin convertir: falta tasa USD/COP)"
         st.markdown(f'<div class="kpi"><div class="lbl">Capital invertido</div>'
-                    f'<div class="val">{money(capital_total)}</div>'
+                    f'<div class="val">{sig_money(capital_total)}</div>'
                     f'<div class="sub">{sub}</div></div>', unsafe_allow_html=True)
     with c2:
         cls = "pos" if kpis["combinado"]["retorno_total"] >= 0 else "neg"
         st.markdown(f'<div class="kpi"><div class="lbl">Recaudo a la fecha</div>'
-                    f'<div class="val {cls}">{money(kpis["combinado"]["retorno_total"])}</div>'
+                    f'<div class="val {cls}">{sig_money(kpis["combinado"]["retorno_total"])}</div>'
                     f'<div class="sub">Renta fija + variable</div></div>', unsafe_allow_html=True)
     with c3:
         cls = "pos" if kpis["combinado"]["mom_delta"] >= 0 else "neg"
         st.markdown(f'<div class="kpi"><div class="lbl">Vs. mes anterior</div>'
-                    f'<div class="val {cls}">{money(kpis["combinado"]["mom_delta"])}</div>'
+                    f'<div class="val {cls}">{sig_money(kpis["combinado"]["mom_delta"])}</div>'
                     f'<div class="sub">Variación mensual</div></div>', unsafe_allow_html=True)
     with c4:
         cls = "pos" if tasa_retorno >= 0 else "neg"
         st.markdown(f'<div class="kpi"><div class="lbl">Tasa de retorno</div>'
-                    f'<div class="val {cls}">{tasa_retorno:.1f}%</div>'
+                    f'<div class="val {cls}">{sig_pct(tasa_retorno)}</div>'
                     f'<div class="sub">sobre capital invertido</div></div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -560,7 +642,6 @@ with tab_inversiones:
         default="Renta fija", label_visibility="collapsed", key="cartera_view")
 
     if vista == "Renta fija":
-        st.markdown("##### Renta fija · CDT / Bolsillos / Alcancías")
 
         tea_promedio = (inv_fixed_df["capital_invertido"] * inv_fixed_df["tea"]).sum() / capital_fija * 100 if capital_fija else 0
         vencimientos = inv_fixed_df["fecha_vencimiento"].dropna()
@@ -569,27 +650,28 @@ with tab_inversiones:
         f1, f2, f3 = st.columns(3, gap="medium")
         with f1:
             st.markdown(f'<div class="kpi"><div class="lbl">Capital</div>'
-                        f'<div class="val">{money(capital_fija)}</div>'
+                        f'<div class="val">{sig_money(capital_fija)}</div>'
                         f'<div class="sub">{len(inv_fixed_df)} productos</div></div>', unsafe_allow_html=True)
         with f2:
             st.markdown(f'<div class="kpi"><div class="lbl">Recaudo</div>'
-                        f'<div class="val pos">{money(kpis["renta_fija"]["retorno_total"])}</div>'
+                        f'<div class="val pos">{sig_money(kpis["renta_fija"]["retorno_total"])}</div>'
                         f'<div class="sub">a la fecha</div></div>', unsafe_allow_html=True)
         with f3:
             st.markdown(f'<div class="kpi"><div class="lbl">Vs. mes anterior</div>'
-                        f'<div class="val pos">{money(kpis["renta_fija"]["mom_delta"])}</div>'
+                        f'<div class="val pos">{sig_money(kpis["renta_fija"]["mom_delta"])}</div>'
                         f'<div class="sub">recaudo del mes</div></div>', unsafe_allow_html=True)
 
         st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
         f4, f5, f6 = st.columns(3, gap="medium")
         with f4:
+            rendimiento_fija = (kpis["renta_fija"]["retorno_total"] / capital_fija * 100) if capital_fija else 0
             st.markdown(f'<div class="kpi"><div class="lbl">Rendimiento</div>'
-                        f'<div class="val pos">{(kpis["renta_fija"]["retorno_total"] / capital_fija * 100) if capital_fija else 0:.1f}%</div>'
+                        f'<div class="val pos">{sig_pct(rendimiento_fija)}</div>'
                         f'<div class="sub">sobre capital</div></div>', unsafe_allow_html=True)
         with f5:
             st.markdown(f'<div class="kpi"><div class="lbl">TEA promedio</div>'
-                        f'<div class="val acc">{tea_promedio:.1f}%</div>'
+                        f'<div class="val acc">{sig_pct(tea_promedio)}</div>'
                         f'<div class="sub">ponderada por capital</div></div>', unsafe_allow_html=True)
         with f6:
             st.markdown(f'<div class="kpi"><div class="lbl">Próximo vencimiento</div>'
@@ -616,7 +698,6 @@ with tab_inversiones:
             use_container_width=True, hide_index=True)
 
     else:
-        st.markdown("##### Renta variable · Acciones / ETF")
         precio_actual = {
             pid: inv_var_price_df[inv_var_price_df["id_posicion"] == pid]["precio"].iloc[-1]
             for pid in inv_var_pos_df["id_posicion"]
@@ -627,36 +708,54 @@ with tab_inversiones:
             for _, row in inv_var_pos_df.iterrows()
         )
         valorizacion_pct = (kpis["renta_variable"]["retorno_total"] / capital_variable_usd * 100) if capital_variable_usd else 0
-        fuente_precio = "Twelve Data (cierre reciente)" if inv_precios_en_vivo else "último valor del CSV"
+        _precios_ts = timestamp_label(inv_meta["precios_fetched_at"])
+        fuente_precio = f"Twelve Data ({_precios_ts})" if inv_precios_en_vivo and _precios_ts else "último valor del CSV"
+        precios_fresh = freshness_badge("Twelve Data" if inv_precios_en_vivo else None, inv_meta["precios_fetched_at"])
+
+        # recaudo_mes = ganancia/pérdida de mercado DE ESTE ciclo (no acumulada);
+        # recaudo_mes_anterior se deriva restando el mom_delta (que ya es la
+        # diferencia entre ambos) para no tener que volver a tocar inv_cycle_df.
+        recaudo_mes = inv_cycle_df.iloc[-1]["valorizacion_renta_variable"] if not inv_cycle_df.empty else 0.0
+        mom_variable = kpis["renta_variable"]["mom_delta"]
+        recaudo_mes_anterior = recaudo_mes - mom_variable
+        aceleracion_pct = (mom_variable / abs(recaudo_mes_anterior) * 100) if recaudo_mes_anterior else None
 
         v1, v2, v3 = st.columns(3, gap="medium")
         with v1:
             st.markdown(f'<div class="kpi"><div class="lbl">Valor de mercado (USD)</div>'
-                        f'<div class="val">{money(valor_mercado)}</div>'
-                        f'<div class="sub">{len(inv_var_pos_df)} posición(es) · {fuente_precio}</div></div>', unsafe_allow_html=True)
+                        f'<div class="val">{sig_money(valor_mercado)}</div>'
+                        f'<div class="sub">{len(inv_var_pos_df)} posición(es) · {fuente_precio} · {precios_fresh}</div></div>',
+                        unsafe_allow_html=True)
         with v2:
-            st.markdown(f'<div class="kpi"><div class="lbl">Costo base (USD)</div>'
-                        f'<div class="val">{money(capital_variable_usd)}</div>'
-                        f'<div class="sub">al precio de compra</div></div>', unsafe_allow_html=True)
-        with v3:
             cls = "pos" if kpis["renta_variable"]["retorno_total"] >= 0 else "neg"
             st.markdown(f'<div class="kpi"><div class="lbl">Recaudo (USD)</div>'
-                        f'<div class="val {cls}">{money(kpis["renta_variable"]["retorno_total"])}</div>'
+                        f'<div class="val {cls}">{sig_money(kpis["renta_variable"]["retorno_total"])}</div>'
                         f'<div class="sub">a la fecha</div></div>', unsafe_allow_html=True)
+        with v3:
+            cls = "pos" if recaudo_mes >= 0 else "neg"
+            st.markdown(f'<div class="kpi"><div class="lbl">Recaudo del mes (USD)</div>'
+                        f'<div class="val {cls}">{sig_money(recaudo_mes)}</div>'
+                        f'<div class="sub">mes anterior: {sig_money(recaudo_mes_anterior)}</div></div>', unsafe_allow_html=True)
 
         st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
         v4, v5, v6 = st.columns(3, gap="medium")
         with v4:
+            if aceleracion_pct is None:
+                st.markdown(f'<div class="kpi"><div class="lbl">Crecimiento Vs. mes anterior</div>'
+                            f'<div class="val" style="font-size:1.3rem">—</div>'
+                            f'<div class="sub">sin mes previo para comparar</div></div>', unsafe_allow_html=True)
+            else:
+                cls = "pos" if aceleracion_pct >= 0 else "neg"
+                verbo = "aceleró" if aceleracion_pct >= 0 else "desaceleró"
+                st.markdown(f'<div class="kpi"><div class="lbl">Crecimiento Vs. mes anterior</div>'
+                            f'<div class="val {cls}">{sig_pct(aceleracion_pct)}</div>'
+                            f'<div class="sub">{verbo} frente al mes pasado</div></div>', unsafe_allow_html=True)
+        with v5:
             cls = "pos" if valorizacion_pct >= 0 else "neg"
             st.markdown(f'<div class="kpi"><div class="lbl">Rendimiento</div>'
-                        f'<div class="val {cls}">{valorizacion_pct:.1f}%</div>'
+                        f'<div class="val {cls}">{sig_pct(valorizacion_pct)}</div>'
                         f'<div class="sub">sobre costo base</div></div>', unsafe_allow_html=True)
-        with v5:
-            cls = "pos" if kpis["renta_variable"]["mom_delta"] >= 0 else "neg"
-            st.markdown(f'<div class="kpi"><div class="lbl">Vs. mes anterior (USD)</div>'
-                        f'<div class="val {cls}">{money(kpis["renta_variable"]["mom_delta"])}</div>'
-                        f'<div class="sub">recaudo del mes</div></div>', unsafe_allow_html=True)
         with v6:
             if inv_fx_rate:
                 fx_sub = {
@@ -664,9 +763,10 @@ with tab_inversiones:
                     "open.er-api.com": "respaldo en vivo (open.er-api.com)",
                     "valor fijo (.env)": "valor fijo configurado (.env)",
                 }.get(inv_fx_source, inv_fx_source or "")
+                fx_fresh = freshness_badge(inv_fx_source, inv_meta["fx_fetched_at"], stale_after_min=2)
                 st.markdown(f'<div class="kpi"><div class="lbl">Tasa USD/COP</div>'
-                            f'<div class="val acc">${inv_fx_rate:,.0f}</div>'
-                            f'<div class="sub">{fx_sub}</div></div>', unsafe_allow_html=True)
+                            f'<div class="val acc">{sig_money(inv_fx_rate)}</div>'
+                            f'<div class="sub">{fx_sub} · {fx_fresh}</div></div>', unsafe_allow_html=True)
             else:
                 st.markdown(f'<div class="kpi"><div class="lbl">Tasa USD/COP</div>'
                             f'<div class="val" style="font-size:1.3rem">No disponible</div>'
@@ -725,7 +825,9 @@ with tab_inversiones:
                        yaxis=dict(title="", gridcolor=BORDER, zerolinecolor=INK))
     st.plotly_chart(figi, use_container_width=True)
 
-    fuente_txt = "Twelve Data (cierre reciente)" if inv_precios_en_vivo else "último valor guardado en el CSV"
+    _precios_ts_bottom = timestamp_label(inv_meta["precios_fetched_at"])
+    fuente_txt = (f"Twelve Data ({_precios_ts_bottom})" if inv_precios_en_vivo and _precios_ts_bottom
+                  else "último valor guardado en el CSV")
     st.markdown(f"<div class='eyebrow' style='margin-top:2rem'>"
                 f"Posiciones desde {'Blob Storage' if not INVESTMENTS_LOCAL else 'CSV local'} · "
                 f"precios: {fuente_txt} · los filtros de la barra lateral no aplican a esta pestaña</div>",

@@ -46,6 +46,8 @@ La pestaña **Inversiones** lee sus posiciones desde un **Blob Storage aparte** 
 
 La tasa USD/COP en particular tiene una cadena de 3 respaldos, porque toda la conversión de la cartera variable depende de ella: (1) Twelve Data, (2) [open.er-api.com](https://www.exchangerate-api.com/docs/free) (fallback gratuito, sin API key), (3) un valor fijo configurable por `USD_COP_FALLBACK_RATE`. Solo si los 3 fallan la tarjeta muestra "No disponible".
 
+Las tarjetas de precio ("Valor de mercado") y de tasa USD/COP incluyen un indicador de frescura (punto verde/rojo + "hace X min") basado en el timestamp real del último fetch exitoso, no en cuándo se renderiza la página — así queda claro si el dato que se está mostrando es reciente o quedó pegado de un fetch viejo (ej. Twelve Data caído y cayendo al respaldo, o al CSV).
+
 La renta variable se muestra en USD (su moneda nativa); para las tarjetas y gráficos que la combinan con la renta fija (en COP) se convierte con la tasa USD/COP del momento — si esa tasa no está disponible, la renta variable se excluye de esos totales combinados en vez de sumar montos en monedas distintas por error.
 
 ## Instalación local
